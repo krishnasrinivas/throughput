@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"syscall"
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/minio/cli"
+	"github.com/ncw/directio"
 )
 
 func main() {
@@ -27,12 +29,16 @@ func main() {
 				cli.StringFlag{
 					Name:  "server",
 					Usage: "http://server:port",
-					Value: "8000",
+					Value: "",
 				},
 				cli.StringFlag{
 					Name:  "duration",
 					Usage: "duration",
 					Value: "10",
+				},
+				cli.BoolFlag{
+					Name:  "directio",
+					Usage: "bypass kernel cache for writes and reads",
 				},
 			},
 		},
@@ -50,6 +56,10 @@ func main() {
 					Name:  "devnull",
 					Usage: "data not written/read to/from disks",
 				},
+				cli.BoolFlag{
+					Name:  "directio",
+					Usage: "bypass kernel cache for writes and reads",
+				},
 			},
 		},
 	}
@@ -59,12 +69,20 @@ func main() {
 func runServer(ctx *cli.Context) {
 	port := ctx.String("port")
 	devnull := ctx.Bool("devnull")
+	dio := ctx.Bool("directio")
+
+	blkSize := 4 * 1024 * 1024
 	router := mux.NewRouter()
 	router.Methods(http.MethodPut).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Path
 		writer := ioutil.Discard
 		if !devnull {
-			f, err := os.OpenFile(filePath, os.O_CREATE|os.O_SYNC|os.O_WRONLY, 0644)
+			var flag int
+			flag = os.O_CREATE | os.O_WRONLY
+			if dio {
+				flag = flag | syscall.O_DIRECT
+			}
+			f, err := os.OpenFile(filePath, flag, 0644)
 			if err != nil {
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte(err.Error()))
@@ -73,15 +91,23 @@ func runServer(ctx *cli.Context) {
 			writer = f
 			defer f.Close()
 		}
-		b := make([]byte, 4*1024*1024)
-		io.CopyBuffer(writer, r.Body, b)
+		b := directio.AlignedBlock(blkSize)
+		_, err := io.CopyBuffer(writer, r.Body, b)
+		if err != nil {
+			log.Fatal(err)
+		}
 	})
 	router.Methods(http.MethodGet).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Path
 		var reader io.Reader
 		reader = &clientReader{0, make(chan struct{})}
 		if !devnull {
-			f, err := os.OpenFile(filePath, os.O_SYNC|os.O_RDONLY, 0644)
+			var flag int
+			flag = os.O_RDONLY
+			if dio {
+				flag = flag | syscall.O_DIRECT
+			}
+			f, err := os.OpenFile(filePath, flag, 0644)
 			if err != nil {
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte(err.Error()))
@@ -90,7 +116,7 @@ func runServer(ctx *cli.Context) {
 			defer f.Close()
 			reader = f
 		}
-		b := make([]byte, 4*1024*1024)
+		b := directio.AlignedBlock(blkSize)
 		io.CopyBuffer(w, reader, b)
 	})
 	router.Methods(http.MethodDelete).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +149,14 @@ func runClient(ctx *cli.Context) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	dio := ctx.Bool("directio")
+
+	if dio && server != "" {
+		fmt.Println(`for directio on the server side, --directio needs to be passed to "througput server" command`)
+	}
+
+	blkSize := 4 * 1024 * 1024
+
 	files := ctx.Args()
 	if len(files) == 0 {
 		cli.ShowCommandHelpAndExit(ctx, "", 1)
@@ -132,16 +166,35 @@ func runClient(ctx *cli.Context) {
 	for _, file := range files {
 		go func(file string) {
 			r := &clientReader{0, doneCh}
-			req, err := http.NewRequest(http.MethodPut, server+file, r)
-			if err != nil {
-				log.Fatal(err)
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				log.Fatal(err)
-			}
-			if resp.StatusCode != http.StatusOK {
-				log.Fatal(err)
+			if server == "" {
+				filePath := file
+				var flag int
+				flag = os.O_CREATE | os.O_WRONLY
+				if dio {
+					flag = flag | syscall.O_DIRECT
+				}
+				f, err := os.OpenFile(filePath, flag, 0644)
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer f.Close()
+				b := directio.AlignedBlock(blkSize)
+				_, err = io.CopyBuffer(f, r, b)
+				if err != nil {
+					log.Fatal(err)
+				}
+			} else {
+				req, err := http.NewRequest(http.MethodPut, server+file, r)
+				if err != nil {
+					log.Fatal(err)
+				}
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					log.Fatal(err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					log.Fatal(err)
+				}
 			}
 			transferCh <- r.n
 		}(file)
@@ -157,30 +210,60 @@ func runClient(ctx *cli.Context) {
 	doneCh = make(chan struct{})
 	for _, file := range files {
 		go func(file string) {
-			b := make([]byte, 500*1024)
+			b := directio.AlignedBlock(blkSize)
 			totalRead := 0
 			for {
-				resp, err := http.Get(server + file)
-				if err != nil {
-					log.Fatal(err)
-				}
-				if resp.StatusCode != http.StatusOK {
-					log.Fatal(err)
-				}
-				for {
-					select {
-					case <-doneCh:
-						transferCh <- totalRead
-						return
-					default:
+				if server == "" {
+					var flag int
+					flag = os.O_RDONLY
+					if dio {
+						flag = flag | syscall.O_DIRECT
 					}
-					n, err := resp.Body.Read(b)
-					totalRead += n
-					if err == io.EOF {
-						break
-					}
+					f, err := os.OpenFile(file, flag, 0644)
 					if err != nil {
 						log.Fatal(err)
+					}
+					defer f.Close()
+
+					for {
+						select {
+						case <-doneCh:
+							transferCh <- totalRead
+							return
+						default:
+						}
+						n, err := f.Read(b)
+						totalRead += n
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							log.Fatal(err)
+						}
+					}
+				} else {
+					resp, err := http.Get(server + file)
+					if err != nil {
+						log.Fatal(err)
+					}
+					if resp.StatusCode != http.StatusOK {
+						log.Fatal(err)
+					}
+					for {
+						select {
+						case <-doneCh:
+							transferCh <- totalRead
+							return
+						default:
+						}
+						n, err := resp.Body.Read(b)
+						totalRead += n
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							log.Fatal(err)
+						}
 					}
 				}
 			}
@@ -195,16 +278,20 @@ func runClient(ctx *cli.Context) {
 	}
 	fmt.Println("Read speed: ", humanize.Bytes(uint64(totalRead/duration)))
 	for _, file := range files {
-		req, err := http.NewRequest(http.MethodDelete, server+file, nil)
-		if err != nil {
-			log.Fatal(err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			log.Fatal(err)
+		if server == "" {
+			os.Remove(file)
+		} else {
+			req, err := http.NewRequest(http.MethodDelete, server+file, nil)
+			if err != nil {
+				log.Fatal(err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				log.Fatal(err)
+			}
 		}
 	}
 }

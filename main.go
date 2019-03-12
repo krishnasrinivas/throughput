@@ -223,18 +223,19 @@ func runClient(ctx *cli.Context) {
 					if err != nil {
 						log.Fatal(err)
 					}
-					defer f.Close()
 
 					for {
 						select {
 						case <-doneCh:
 							transferCh <- totalRead
+							f.Close()
 							return
 						default:
 						}
 						n, err := f.Read(b)
 						totalRead += n
 						if err == io.EOF {
+							f.Close()
 							break
 						}
 						if err != nil {
@@ -252,6 +253,7 @@ func runClient(ctx *cli.Context) {
 					for {
 						select {
 						case <-doneCh:
+							resp.Body.Close()
 							transferCh <- totalRead
 							return
 						default:
@@ -259,6 +261,7 @@ func runClient(ctx *cli.Context) {
 						n, err := resp.Body.Read(b)
 						totalRead += n
 						if err == io.EOF {
+							resp.Body.Close()
 							break
 						}
 						if err != nil {

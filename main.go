@@ -40,6 +40,15 @@ func main() {
 					Name:  "directio",
 					Usage: "bypass kernel cache for writes and reads",
 				},
+				cli.BoolFlag{
+					Name:  "sync",
+					Usage: "commit data and metadata to disk",
+				},
+				cli.IntFlag{
+					Name:  "blocksize",
+					Usage: "block size for write() system calls",
+					Value: 4 * 1024 * 1024,
+				},
 			},
 		},
 		{
@@ -60,6 +69,15 @@ func main() {
 					Name:  "directio",
 					Usage: "bypass kernel cache for writes and reads",
 				},
+				cli.BoolFlag{
+					Name:  "sync",
+					Usage: "commit data and metadata to disk",
+				},
+				cli.IntFlag{
+					Name:  "blocksize",
+					Usage: "block size for write() system calls",
+					Value: 4 * 1024 * 1024,
+				},
 			},
 		},
 	}
@@ -70,8 +88,10 @@ func runServer(ctx *cli.Context) {
 	port := ctx.String("port")
 	devnull := ctx.Bool("devnull")
 	dio := ctx.Bool("directio")
+	sync := ctx.Bool("sync")
 
-	blkSize := 4 * 1024 * 1024
+	blkSize := ctx.Int("blocksize")
+
 	router := mux.NewRouter()
 	router.Methods(http.MethodPut).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Path
@@ -81,6 +101,9 @@ func runServer(ctx *cli.Context) {
 			flag = os.O_CREATE | os.O_WRONLY
 			if dio {
 				flag = flag | syscall.O_DIRECT
+			}
+			if sync {
+				flag = flag | syscall.O_SYNC
 			}
 			f, err := os.OpenFile(filePath, flag, 0644)
 			if err != nil {
@@ -150,12 +173,17 @@ func runClient(ctx *cli.Context) {
 		log.Fatal(err)
 	}
 	dio := ctx.Bool("directio")
+	sync := ctx.Bool("sync")
+
+	blkSize := ctx.Int("blocksize")
 
 	if dio && server != "" {
 		fmt.Println(`for directio on the server side, --directio needs to be passed to "througput server" command`)
 	}
 
-	blkSize := 4 * 1024 * 1024
+	if sync && server != "" {
+		fmt.Println(`for sync on the server side, --sync needs to be passed to "througput server" command`)
+	}
 
 	files := ctx.Args()
 	if len(files) == 0 {
@@ -173,15 +201,21 @@ func runClient(ctx *cli.Context) {
 				if dio {
 					flag = flag | syscall.O_DIRECT
 				}
+				if sync {
+					flag = flag | syscall.O_SYNC
+				}
 				f, err := os.OpenFile(filePath, flag, 0644)
 				if err != nil {
 					log.Fatal(err)
 				}
-				defer f.Close()
+				defer func() {
+					f.Sync()
+					f.Close()
+				}()
 				b := directio.AlignedBlock(blkSize)
 				_, err = io.CopyBuffer(f, r, b)
 				if err != nil {
-					log.Fatal(err)
+					log.Fatal("READ", err)
 				}
 			} else {
 				req, err := http.NewRequest(http.MethodPut, server+file, r)
@@ -239,7 +273,7 @@ func runClient(ctx *cli.Context) {
 							break
 						}
 						if err != nil {
-							log.Fatal(err)
+							log.Fatal("WRITE", err)
 						}
 					}
 				} else {

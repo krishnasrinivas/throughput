@@ -213,9 +213,15 @@ func runClient(ctx *cli.Context) {
 					f.Close()
 				}()
 				b := directio.AlignedBlock(blkSize)
-				_, err = io.CopyBuffer(f, r, b)
-				if err != nil {
-					log.Fatal("READ", err)
+				for {
+					_, err = r.Read(b)
+					if err == io.EOF {
+						break
+					}
+					_, err = f.Write(b)
+					if err != nil {
+						log.Fatal("READ", err)
+					}
 				}
 			} else {
 				req, err := http.NewRequest(http.MethodPut, server+file, r)
